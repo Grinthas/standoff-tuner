@@ -1,8 +1,6 @@
 package com.grinthas.standofftuner
 
-import android.Manifest
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -10,7 +8,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -26,7 +23,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -36,52 +33,36 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import rikka.shizuku.Shizuku
-import kotlin.math.roundToInt
 
 private val Accent = Color(0xFFFF9A3C)
 private val Bg = Color(0xFF101216)
 private val CardBg = Color(0xFF1A1D23)
 private val Muted = Color(0xFF8A919C)
+private val Good = Color(0xFF6FCF7F)
+private val Warn = Color(0xFFF0B04A)
 
 class MainActivity : ComponentActivity() {
-    private lateinit var tweaks: Tweaks
+    private lateinit var opt: Optimizer
 
-    private var shizuku by mutableStateOf(Shell.Status.NOT_RUNNING)
-    private var options by mutableStateOf(Options())
-    private var applied by mutableStateOf(false)
-    private var screen by mutableStateOf<Pair<Int, Int>?>(null)
-    private var log by mutableStateOf("")
+    private var checks by mutableStateOf<List<Check>>(emptyList())
+    private var dnd by mutableStateOf(false)
+    private var dndAllowed by mutableStateOf(false)
 
-    private val binderListener = Shizuku.OnBinderReceivedListener { refresh() }
-    private val deadListener = Shizuku.OnBinderDeadListener { refresh() }
-    private val permissionListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refresh() }
+    // Игра запускалась из приложения: при возвращении вернём режим уведомлений.
+    private var launchedGame = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        tweaks = Tweaks(this)
-        options = tweaks.options
-        Shizuku.addBinderReceivedListenerSticky(binderListener)
-        Shizuku.addBinderDeadListener(deadListener)
-        Shizuku.addRequestPermissionResultListener(permissionListener)
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
-        }
+        opt = Optimizer(this)
+        dnd = opt.doNotDisturb
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Accent, background = Bg, surface = Bg)) {
                 Surface(Modifier.fillMaxSize(), color = Bg) { Screen() }
@@ -91,76 +72,42 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (launchedGame) {
+            launchedGame = false
+            opt.restoreDnd()
+        }
         refresh()
-    }
-
-    override fun onDestroy() {
-        Shizuku.removeBinderReceivedListener(binderListener)
-        Shizuku.removeBinderDeadListener(deadListener)
-        Shizuku.removeRequestPermissionResultListener(permissionListener)
-        super.onDestroy()
     }
 
     private fun refresh() {
-        runOnUiThread {
-            shizuku = runCatching { Shell.status() }.getOrDefault(Shell.Status.NOT_RUNNING)
-            applied = tweaks.applied
-        }
-        Thread {
-            val size = if (Shell.status() == Shell.Status.READY) runCatching { tweaks.physicalSize() }.getOrNull() else null
-            runOnUiThread { screen = size }
-        }.start()
-    }
-
-    private fun maxRefreshRate(): Float {
         @Suppress("DEPRECATION")
-        val d = if (Build.VERSION.SDK_INT >= 30) display else windowManager.defaultDisplay
-        return d?.supportedModes?.maxOfOrNull { it.refreshRate } ?: 60f
+        val display = if (Build.VERSION.SDK_INT >= 30) display else windowManager.defaultDisplay
+        checks = opt.checks(display)
+        dndAllowed = opt.canControlDnd
     }
 
-    private fun update(o: Options) {
-        options = o
-        tweaks.options = o
+    private fun open(intent: Intent?) {
+        if (intent == null) return
+        runCatching { startActivity(intent) }.onFailure {
+            // Некоторые прошивки не поддерживают отдельные экраны — открываем общие настройки.
+            runCatching { startActivity(Intent(android.provider.Settings.ACTION_SETTINGS)) }
+        }
     }
 
-    private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
-
-    private fun openUrl(url: String) {
-        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
-    }
-
-    private suspend fun launchGame() {
+    private fun launchGame() {
         val launch = packageManager.getLaunchIntentForPackage(GAME_PACKAGE)
         if (launch == null) {
-            toast("Standoff 2 не установлен")
+            Toast.makeText(this, "Standoff 2 не установлен", Toast.LENGTH_LONG).show()
+            open(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$GAME_PACKAGE")))
             return
         }
-        val result = withContext(Dispatchers.IO) {
-            runCatching { tweaks.apply(options, maxRefreshRate()) }
-        }
-        result.onFailure {
-            toast("Ошибка: ${it.message}")
-            return
-        }
-        log = result.getOrThrow().joinToString("\n")
-        applied = true
-        startForegroundService(Intent(this, WatchService::class.java))
+        if (dnd) opt.enableDnd()
+        launchedGame = true
         startActivity(launch)
-    }
-
-    private suspend fun restoreAll() {
-        withContext(Dispatchers.IO) { runCatching { tweaks.restore() } }
-            .onSuccess { toast("Настройки возвращены") }
-            .onFailure { toast("Ошибка: ${it.message}") }
-        stopService(Intent(this, WatchService::class.java))
-        log = ""
-        refresh()
     }
 
     @Composable
     private fun Screen() {
-        val scope = rememberCoroutineScope()
-        val ready = shizuku == Shell.Status.READY
         Column(
             Modifier
                 .fillMaxSize()
@@ -171,74 +118,58 @@ class MainActivity : ComponentActivity() {
         ) {
             Column {
                 Text("Standoff Tuner", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                Text("Растяжение и оптимизация для Standoff 2", color = Muted)
+                Text("Подготовка телефона к игре на максимальном FPS", color = Muted)
             }
 
-            ShizukuCard()
+            val okCount = checks.count { it.ok }
+            Section("Готовность к игре: $okCount из ${checks.size}") {
+                checks.forEachIndexed { i, c ->
+                    if (i > 0) HorizontalDivider(color = Color(0xFF2A2E36))
+                    CheckRow(c)
+                }
+                OutlinedButton(onClick = { refresh() }) { Text("Проверить снова") }
+            }
 
-            Section("Растяжение экрана") {
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ASPECTS.forEachIndexed { i, a ->
-                        FilterChip(
-                            selected = options.aspect == i,
-                            onClick = { update(options.copy(aspect = i)) },
-                            label = { Text(a.label) },
+            Section("Во время игры") {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Режим «Не беспокоить»", color = Color.White)
+                        Text(
+                            "Уведомления не всплывают поверх игры и не отнимают FPS. Возвращается, когда вы вернётесь в приложение.",
+                            color = Muted, fontSize = 12.sp,
                         )
                     }
+                    Switch(
+                        checked = dnd && dndAllowed,
+                        onCheckedChange = {
+                            if (!dndAllowed) open(opt.dndSettingsIntent())
+                            else { dnd = it; opt.doNotDisturb = it }
+                        },
+                    )
                 }
-                val ratio = ASPECTS[options.aspect].ratio
-                val size = screen
-                val hint = when {
-                    ratio == null -> "Экран останется как есть."
-                    size == null -> "Разрешение покажется после подключения Shizuku."
-                    else -> {
-                        val short = minOf(size.first, size.second)
-                        val long = ((short * ratio).roundToInt() / 2) * 2
-                        "${maxOf(size.first, size.second)}×$short → $long×$short"
-                    }
-                }
-                Text(hint, color = Muted, fontSize = 13.sp)
-            }
-
-            Section("Оптимизация") {
-                Toggle("Игровой режим «Производительность»", "Android 12+, cmd game mode", options.gameMode) {
-                    update(options.copy(gameMode = it))
-                }
-                Toggle("Отключить анимации системы", "Быстрее отклик интерфейса", options.noAnimations) {
-                    update(options.copy(noAnimations = it))
-                }
-                Toggle("Максимальная частота экрана", "${maxRefreshRate().toInt()} Гц на время игры", options.maxRefresh) {
-                    update(options.copy(maxRefresh = it))
-                }
-                Toggle("Закрыть фоновые приложения", "Освобождает память перед запуском", options.killBackground) {
-                    update(options.copy(killBackground = it))
+                if (!dndAllowed) {
+                    Text("Нужно разрешить доступ к режиму «Не беспокоить» для Standoff Tuner.", color = Warn, fontSize = 12.sp)
                 }
             }
 
             Button(
-                onClick = { scope.launch { launchGame() } },
-                enabled = ready,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
+                onClick = { launchGame() },
+                modifier = Modifier.fillMaxWidth().height(56.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Color(0xFF1A1006)),
             ) { Text("Запустить Standoff 2", fontSize = 17.sp, fontWeight = FontWeight.SemiBold) }
 
-            OutlinedButton(
-                onClick = { scope.launch { restoreAll() } },
-                enabled = ready,
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text(if (applied) "Вернуть всё (настройки ещё изменены)" else "Вернуть всё как было") }
-
-            if (log.isNotEmpty()) {
-                Section("Выполнено") {
-                    Text(log, fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = Muted)
-                }
+            Section("Ещё советы") {
+                listOf(
+                    "Включите игровой режим телефона (на vivo/iQOO — «Ultra Game Mode» или «Игровой центр») и добавьте туда Standoff 2.",
+                    "В самой игре выберите частоту кадров выше, чем «Высокая», если телефон позволяет, и выключите тени.",
+                    "Не играйте на зарядке и в чехле — нагрев снижает частоты процессора.",
+                    "Перед игрой закройте браузер, соцсети и видео в меню недавних приложений.",
+                ).forEach { Text("• $it", color = Muted, fontSize = 13.sp) }
             }
 
             Text(
-                "Программа меняет только системные настройки Android и не трогает файлы игры. " +
-                    "Всё возвращается автоматически после выхода из Standoff 2 или кнопкой в уведомлении.",
+                "Без root и ADB Android не даёт приложениям менять системные настройки, поэтому " +
+                    "Standoff Tuner проверяет их и открывает нужный экран. Файлы игры не изменяются.",
                 color = Muted, fontSize = 12.sp,
             )
             Spacer(Modifier.height(8.dp))
@@ -246,51 +177,33 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun ShizukuCard() {
-        val (title, text) = when (shizuku) {
-            Shell.Status.READY -> "Shizuku подключён" to "Всё готово."
-            Shell.Status.NO_PERMISSION -> "Нужно разрешение" to "Разрешите Standoff Tuner доступ к Shizuku."
-            Shell.Status.NOT_RUNNING -> "Shizuku не запущен" to
-                "Установите Shizuku и запустите его через «Беспроводную отладку» (root не нужен)."
-        }
-        Section(title, highlight = shizuku != Shell.Status.READY) {
-            Text(text, color = Muted, fontSize = 13.sp)
-            when (shizuku) {
-                Shell.Status.NO_PERMISSION -> Button(onClick = { Shizuku.requestPermission(1) }) { Text("Разрешить") }
-                Shell.Status.NOT_RUNNING -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = {
-                        val shizukuApp = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
-                        if (shizukuApp != null) startActivity(shizukuApp)
-                        else openUrl("https://play.google.com/store/apps/details?id=moe.shizuku.privileged.api")
-                    }) { Text("Открыть Shizuku") }
-                    OutlinedButton(onClick = { openUrl("https://shizuku.rikka.app/guide/setup/") }) { Text("Инструкция") }
+    private fun CheckRow(c: Check) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(vertical = 4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(if (c.ok) "✓" else "!", color = if (c.ok) Good else Warn, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(end = 10.dp))
+                Text(c.title, color = Color.White, modifier = Modifier.weight(1f))
+                Text(c.value, color = if (c.ok) Good else Warn, fontSize = 13.sp)
+            }
+            if (!c.ok) {
+                Text(c.hint, color = Muted, fontSize = 12.sp)
+                c.fix?.let { intent ->
+                    Button(onClick = { open(intent) }) { Text("Открыть настройки") }
                 }
-                Shell.Status.READY -> {}
             }
         }
     }
 
     @Composable
-    private fun Section(title: String, highlight: Boolean = false, content: @Composable () -> Unit) {
+    private fun Section(title: String, content: @Composable () -> Unit) {
         Card(
-            colors = CardDefaults.cardColors(containerColor = if (highlight) Color(0xFF2A2014) else CardBg),
+            colors = CardDefaults.cardColors(containerColor = CardBg),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(title, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, color = Color.White)
                 content()
             }
-        }
-    }
-
-    @Composable
-    private fun Toggle(title: String, subtitle: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(title, color = Color.White)
-                Text(subtitle, color = Muted, fontSize = 12.sp)
-            }
-            Switch(checked = checked, onCheckedChange = onChange)
         }
     }
 }

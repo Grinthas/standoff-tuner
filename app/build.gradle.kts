@@ -46,10 +46,6 @@ android {
 }
 
 dependencies {
-    val shizuku = "13.1.5"
-    implementation("dev.rikka.shizuku:api:$shizuku")
-    implementation("dev.rikka.shizuku:provider:$shizuku")
-
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
